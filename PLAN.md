@@ -8,10 +8,10 @@
 
 ## Progress
 
-- [x] **Stage 0** — Tooling installed (zig 0.16.0, jq). _TODO: confirm Docker binfmt is set up._
+- [x] **Stage 0** — Tooling installed (zig 0.16.0, jq); Docker binfmt/Rosetta confirmed (amd64 emulation runs).
 - [x] **Stage 1** — `hello.c` built for aarch64-musl / x86_64-musl / x86_64-gnu (committed).
-- [ ] **Stage 2** — tiny C++ on musl (iostream + std::string + exceptions)
-- [ ] **Stage 3** — tiny Go + cgo on musl
+- [x] **Stage 2** — tiny C++ ran on Alpine (arm64 + amd64); exception thrown/caught ✓ (the C++ runtime de-risk).
+- [x] **Stage 3** — tiny Go + cgo ran static on Alpine arm64 ✓ (full Go+cgo+zig+musl path proven; last rung before DuckDB).
 - [ ] **Stage 4** — build `libduckdb` for musl (the hard part)
 - [ ] **Stage 5** — build the plugin against the musl `libduckdb`
 - [ ] **Stage 6** — run on Alpine (prove #80 is fixed)
@@ -23,6 +23,7 @@
 - Toolchain: zig **0.16.0**, Go 1.26, Docker 29, Homebrew.
 - Scratch work happens in this repo (`zig-cc-lab/`). The plugin is a **separate clone** of
   `motherduckdb/grafana-duckdb-datasource`.
+- **Layout:** each stage lives in its own folder (`stage1-c/`, `stage2-cpp/`, `stage3-cgo/`, `stage4-duckdb/`) so cgo never picks up a sibling stage's `.c`/`.cpp` (which would collide on `main` — see Stage 3). Run each stage's commands from the repo root.
 
 ## My honest take (read first)
 
@@ -60,6 +61,8 @@ docker run --privileged --rm tonistiigi/binfmt --install all
 Cross-compile to 3 targets, then run each via Docker (not host qemu):
 
 ```bash
+# run from the repo root
+mkdir -p stage1-c && cd stage1-c
 cat > hello.c <<'EOF'        # quoted-heredoc: shell/printf won't eat the %s
 #include <stdio.h>
 int main(void) { printf("hello from %s\n", "a zig-cross-compiled binary"); return 0; }
@@ -80,6 +83,8 @@ What `file` should show: musl targets are **statically linked** (portable, run a
 Higher-signal than the blog's LuaJIT step: this directly probes static-musl C++ — `iostream`, `std::string`, and **exception unwinding** (libc++ / libc++abi), the exact runtime wrinkle that can bite in Stages 4–5.
 
 ```bash
+# run from the repo root
+mkdir -p stage2-cpp && cd stage2-cpp
 cat > hellocpp.cpp <<'EOF'
 #include <iostream>
 #include <string>
@@ -98,19 +103,46 @@ docker run --rm --platform linux/amd64 -v "$PWD:/w" -w /w alpine ./hellocpp.x86_
 ```
 If both print the line (i.e. the exception was thrown and caught), static C++ on musl works and DuckDB's C++ is very likely to link and run.
 
+> `-Wno-nullability-completeness` silences ~119 harmless warnings from Zig 0.16's bundled libc++ headers (an Apple/Clang nullability check) — they're not from our code. For the much noisier DuckDB build (Stage 4) we'll likely use `-w` to mute warnings entirely.
+
 ## Stage 3 — Tiny CGo Go program with Zig (de-risks DuckDB)
 
-Minimal `import "C"` program, cross-compiled with Zig as the C compiler, run on Alpine:
+Minimal `import "C"` program, cross-compiled with Zig as the C compiler, run on Alpine.
+
+> **Gotcha:** a cgo package automatically compiles every `.c`/`.cpp` file in **its own directory**. Our `hello.c` and `hellocpp.cpp` from Stages 1–2 each define `main()`, so building the Go program in the repo root collides (`ld.lld: error: duplicate symbol: main`). Fix: put the Go program in its own subdir (`stage3-cgo/`) so it has no stray C/C++ siblings. (If you skipped here: `package .: no Go files in ...` means there's no `.go` file in the build dir.)
 
 ```bash
+mkdir -p stage3-cgo
+cat > stage3-cgo/main.go <<'EOF'
+package main
+
+/*
+#include <stdlib.h>
+#include <stdio.h>
+static void greet(const char* who) { printf("hello from Go+cgo (musl): %s\n", who); }
+*/
+import "C"
+import "unsafe"
+
+func main() {
+	s := C.CString("cgo works")
+	defer C.free(unsafe.Pointer(s))
+	C.greet(s)
+}
+EOF
+cd stage3-cgo && go mod init cgohello
+
 CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
   CC="zig cc -target aarch64-linux-musl" CXX="zig c++ -target aarch64-linux-musl" \
   go build -ldflags '-linkmode external -extldflags "-static"' -o cgohello .
+file cgohello                                                   # expect: ARM aarch64, statically linked
 docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w alpine ./cgohello
 ```
 This proves Go + cgo + zig + musl end-to-end before the big DuckDB build.
 
 ## Stage 4 — Build `libduckdb` for musl (the hard, uncertain step)
+
+> Work in a dedicated subdir (e.g. `stage4-duckdb/`) so `duckdb.cpp` never sits in a Go package directory — same cgo "duplicate symbol: main" rule as Stage 3.
 
 - Determine the DuckDB version the bindings expect (encoded in `duckdb-go-bindings v0.10503/4` ↔ `duckdb-go/v2 v2.10503/4`, and the bundled `include/duckdb.h`); download the matching `libduckdb-src.zip` (amalgamation: `duckdb.cpp`, `duckdb.hpp`, `duckdb.h`).
 - Compile the single-TU amalgamation per target with `zig c++` (slow, RAM-heavy — expect minutes + GBs):
