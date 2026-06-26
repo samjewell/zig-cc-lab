@@ -90,8 +90,8 @@ int main() {
   return 0;
 }
 EOF
-zig c++ -o hellocpp.aarch64-musl hellocpp.cpp -target aarch64-linux-musl
-zig c++ -o hellocpp.x86_64-musl  hellocpp.cpp -target x86_64-linux-musl
+zig c++ -Wno-nullability-completeness -o hellocpp.aarch64-musl hellocpp.cpp -target aarch64-linux-musl
+zig c++ -Wno-nullability-completeness -o hellocpp.x86_64-musl  hellocpp.cpp -target x86_64-linux-musl
 file hellocpp.*                                            # expect: statically linked
 docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w alpine ./hellocpp.aarch64-musl
 docker run --rm --platform linux/amd64 -v "$PWD:/w" -w /w alpine ./hellocpp.x86_64-musl
