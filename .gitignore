@@ -1,0 +1,20 @@
+# Build artifacts — all regenerable, see PLAN.md. Keep them OUT of git.
+
+# Object files & static libraries
+# (the DuckDB .o is ~456 MB and the .a ~461 MB — far over GitHub's 100 MB limit)
+*.o
+*.a
+
+# Cross-compiled demo binaries (Stages 1-3)
+*.aarch64-musl
+*.x86_64-musl
+*.x86_64-gnu
+stage3-cgo/cgohello
+
+# Downloaded DuckDB v1.5.4 amalgamation source (re-fetch via PLAN.md Stage 4)
+stage4-duckdb/duckdb.cpp
+stage4-duckdb/duckdb.hpp
+stage4-duckdb/duckdb*.h
+
+# Built libduckdb output dirs
+stage4-duckdb/libduckdb-*/

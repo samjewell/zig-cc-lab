@@ -12,7 +12,7 @@
 - [x] **Stage 1** — `hello.c` built for aarch64-musl / x86_64-musl / x86_64-gnu (committed).
 - [x] **Stage 2** — tiny C++ ran on Alpine (arm64 + amd64); exception thrown/caught ✓ (the C++ runtime de-risk).
 - [x] **Stage 3** — tiny Go + cgo ran static on Alpine arm64 ✓ (full Go+cgo+zig+musl path proven; last rung before DuckDB).
-- [ ] **Stage 4** — build `libduckdb` for musl (the hard part)
+- [ ] **Stage 4** — `libduckdb.a` for **aarch64-musl** built ✓ (461 MB, 7m22s @ `-O1`, DuckDB v1.5.4); x86_64-musl still pending.
 - [ ] **Stage 5** — build the plugin against the musl `libduckdb`
 - [ ] **Stage 6** — run on Alpine (prove #80 is fixed)
 - [ ] **Stage 7** — (optional) productionize + PR for #80
