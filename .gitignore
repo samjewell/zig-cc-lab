@@ -18,3 +18,7 @@ stage4-duckdb/duckdb*.h
 
 # Built libduckdb output dirs
 stage4-duckdb/libduckdb-*/
+
+# Editor / OS / debug-session junk
+.DS_Store
+.cursor/

@@ -144,22 +144,52 @@ This proves Go + cgo + zig + musl end-to-end before the big DuckDB build.
 
 > Work in a dedicated subdir (e.g. `stage4-duckdb/`) so `duckdb.cpp` never sits in a Go package directory — same cgo "duplicate symbol: main" rule as Stage 3.
 
-- Determine the DuckDB version the bindings expect (encoded in `duckdb-go-bindings v0.10503/4` ↔ `duckdb-go/v2 v2.10503/4`, and the bundled `include/duckdb.h`); download the matching `libduckdb-src.zip` (amalgamation: `duckdb.cpp`, `duckdb.hpp`, `duckdb.h`).
-- Compile the single-TU amalgamation per target with `zig c++` (slow, RAM-heavy — expect minutes + GBs):
+**1. Pin the version + download the amalgamation.** The plugin's `duckdb-go/v2 v2.10504.0` → bindings `v0.10504.0` → **DuckDB v1.5.4** (scheme: `v0.105XX.0` = `v1.5.XX`; confirmed by `#define DUCKDB_VERSION "v1.5.4"` in `duckdb.hpp`).
 
 ```bash
-mkdir -p libduckdb-aarch64-musl
-zig c++ -target aarch64-linux-musl -std=c++11 -O2 -fPIC -c duckdb.cpp -o duckdb.o
-zig ar rcs libduckdb-aarch64-musl/libduckdb.a duckdb.o
+mkdir -p stage4-duckdb && cd stage4-duckdb
+curl -fL -o libduckdb-src.zip https://github.com/duckdb/duckdb/releases/download/v1.5.4/libduckdb-src.zip
+unzip -o -q libduckdb-src.zip && rm -f libduckdb-src.zip   # → duckdb.cpp (25 MB), duckdb.hpp, duckdb.h, duckdb_extension.h
 ```
-- Shortcut to check first: see if anyone already publishes musl `.a` (upstream issue `duckdb/duckdb-go-bindings#72`).
+
+**2. Compile the 25 MB single-TU amalgamation with `zig c++`** (slow, RAM-heavy — single-threaded, several minutes). **One build is all you need**: under `zig c++`, `-O1`/`-O2`/`-O3` all produce the same `-O2`-equivalent object (see the Finding below), so there's no point in per-level variants or cache isolation — just build once.
+
+```bash
+# from stage4-duckdb/  (run once; -O1 == -O2 == -O3 under zig, so just use -O2)
+mkdir -p libduckdb-aarch64-musl
+time zig c++ -target aarch64-linux-musl -std=c++11 -O2 -DNDEBUG -fPIC -w -c duckdb.cpp -o libduckdb-aarch64-musl/duckdb.o
+zig ar rcs libduckdb-aarch64-musl/libduckdb.a libduckdb-aarch64-musl/duckdb.o
+ls -lh libduckdb-aarch64-musl/
+```
+
+The experiment that revealed the collapse (each a genuine compile on M3 Pro / 18 GB, `aarch64-linux-musl`, single-threaded):
+
+| level | wall time | `libduckdb.a` | object                  |
+| ----- | --------- | ------------- | ----------------------- |
+| `-O1` | 7m22s     | 461 MB        | baseline                |
+| `-O2` | 4m23s     | 461 MB        | byte-identical to `-O1` |
+| `-O3` | 4m28s     | 461 MB        | byte-identical to `-O1` |
+
+> **Finding (confirmed with runtime evidence):** `zig cc`/`zig c++` collapses `-O1`/`-O2`/`-O3` (and `-Ofast`) into ONE optimization mode — all emit byte-identical objects (478,459,816 B; `cmp`-identical), despite each being a genuine ~4–7 min compile. Verified on a small program (`opt-test/probe-opt.sh`): zig gives `-O1`=`-O2`=`-O3` while `-O0`/`-Os` differ, whereas real `clang` produces a *distinct* `-O1`. DuckDB does NOT pin `-O3` (only 2 localized `__attribute__((optimize))`). So under zig there's effectively a single optimized build — pick any level; building three is redundant. **Mechanism** (confirmed in Zig source `main.zig`/`Compilation.zig`): `-O1/-O2/-O3/-O4/-Ofast` → Zig `ReleaseFast` → clang `-cc1 -O2` (Zig deliberately avoids `-O3` for C/C++ as "tested less / less safe"). So what you actually have is a **`-O2`-equivalent** DuckDB. Note: no clean `-O3`-release path found — `-Xclang -O3` on `zig cc -c` is a no-op (cc1 gets both `-O2` and `-O3`; the earlier `-O2` wins), and `zig build-obj -cflags -O3` *does* reach clang but only in Debug mode (drags in `-fsanitize=undefined`, frame pointers), while `-OReleaseFast` re-collapses to `-O2`. A genuine `-O3` release would need real clang + a musl sysroot. Likely not worth it — `-O2` is fine/recommended for this much C++.
+>
+> Memory note: `-O1` peaked ~2.6 GB+ resident; each real build is single-threaded (~one core).
+
+> **Why staying on `-O2` is justified — the `-O2`→`-O3` perf delta is small.** For whole-application/DB workloads it's low single digits, not worth fragmenting the toolchain (libc++ vs libstdc++) to chase:
+> - **PostgreSQL** (real DBMS, pgbench — [Eisentraut 2024](http://peter.eisentraut.org/blog/2024/06/25/postgresql-performance-with-different-compilers)): `-O3` vs `-O2` ≈ **~1%** (and `-Os` was ~10% *slower*).
+> - **clang microbenchmarks** ([markaicode 2025](https://markaicode.com/vs/gcc-14-vs-clang-18/)): ~**2–4%** on string/memory work, up to **~14–18%** only on pure FP/SIMD kernels.
+> - `-O3` can even **regress** on big codebases (aggressive unrolling → code bloat → L1 i-cache misses — [Stan forum](https://discourse.mc-stan.org/t/o2-vs-o3-compiler-optimization-level/3714)).
+> - LLVM/clang's `-O2`↔`-O3` gap is **smaller than GCC's** ([SUSE GCC 11 docs](https://documentation.suse.com/sbp/devel-tools/pdf/SBP-GCC-11_en.pdf)), and clang `-O2` already auto-vectorizes — and zig *is* clang.
+> - **DuckDB estimate:** low single digits (likely ~1–5%, plausibly nearer PostgreSQL's ~1%); its speed is dominated by its vectorized execution engine/algorithms, not compiler auto-vec of scalar loops. Only a benchmark on representative queries would pin the exact number.
+> - **Decision: stay on `-O2`.** (Zig also argues `-O2` is the safer/better-tested path for C/C++.)
+
+- Shortcut to check first: see if anyone already publishes a musl `.a` (upstream issue `duckdb/duckdb-go-bindings#72`).
 
 ## Stage 5 — Build the plugin against the musl `libduckdb`
 
 In the **plugin repo clone** (`grafana-duckdb-datasource`), bypass Mage for the experiment and build the backend (`./pkg`) directly with the static-lib tag. Point `LIBDIR` at the `.a` produced in Stage 4:
 
 ```bash
-LIBDIR=/absolute/path/to/zig-cc-lab/libduckdb-aarch64-musl   # the .a built in Stage 4
+LIBDIR=/path/to/zig-cc-lab/stage4-duckdb/libduckdb-aarch64-musl   # dir holding the libduckdb.a from Stage 4
 CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
   CC="zig cc -target aarch64-linux-musl" CXX="zig c++ -target aarch64-linux-musl" \
   CGO_LDFLAGS="-L$LIBDIR -lduckdb -lc++ -lc++abi -lm -static" \
