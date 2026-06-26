@@ -15,7 +15,7 @@
 - [x] **Stage 4** — `libduckdb.a` for **aarch64-musl** built (461 MB, DuckDB v1.5.4); plus the finding that zig folds `-O1/-O2/-O3` into one `-O2`-equivalent. (x86_64-musl not built — identical recipe.)
 - [x] **Stage 5** — plugin backend linked against the musl `libduckdb.a` ✓ — **331 MB fully static** aarch64 ELF (no `NEEDED` libs, no loader), built first try with `-lc++ -lc++abi`.
 - [x] **Stage 6** — ran on Alpine (arm64) ✓✓: plugin SDK initializes, and a standalone `SELECT 21*2` returns **42** — DuckDB executes queries on musl. **#80 proven solved.**
-- [ ] **Stage 7** — (optional) productionize + PR for #80 — left as a deliberate follow-up (see Stage 7 + "Follow-ups").
+- [x] **Stage 7 (draft)** — opened draft PR [#94](https://github.com/motherduckdb/grafana-duckdb-datasource/pull/94) adding a Zig/musl CI workflow; **green on the fork for amd64 + arm64** (build + Alpine smoke test). Awaiting maintainer review.
 
 ## Environment (this machine)
 
@@ -233,7 +233,7 @@ Once the plugin works, do the trivial contrast: cross-compile Grafana's backend 
 
 ## Follow-ups (not done in this session — left for you)
 
-- **Stage 7 (PR for #80):** open a PR on `motherduckdb/grafana-duckdb-datasource` adding a Zig/musl static build (a Magefile target + CI job). Left deliberately — it's a third-party repo and a contribution decision that's yours. Bonus: `zig cc` in CI needs **no QEMU** (pure cross-compile), unlike their current emulated arm64 container build.
+- **Stage 7 (PR for #80):** done as a draft — PR [#94](https://github.com/motherduckdb/grafana-duckdb-datasource/pull/94) adds `.github/workflows/build-linux-musl.yml` (cross-compiles static musl binaries with `zig cc` — no QEMU for the build — and smoke-tests them on Alpine). **CI is green on the fork for amd64 + arm64** (arm64 needs an added swap step for the memory-heavy aarch64 amalgamation compile; pinned Zig 0.16.0). Remaining: maintainer review + the PR's design questions (long-term source of `libduckdb.a`; whether the static build replaces the glibc `linux` build; Magefile target vs standalone workflow).
 - **x86_64-musl `libduckdb`:** not built — identical recipe (`-target x86_64-linux-musl`). Worth doing since Grafana Cloud nodes are likely amd64; run on Alpine amd64 via Rosetta/qemu or a real amd64 K8s node.
 - **Full Grafana-on-Alpine UI run** + a `read_csv_auto(...)`/extension query (the Stage 6 stretch). The binary-level proof is done; this is packaging.
 - **`-O3`** — only if a benchmark on real queries justifies it; that means native Alpine gcc, not zig (see the Stage 4 `-O2` justification).
