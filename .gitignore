@@ -19,6 +19,9 @@ stage4-duckdb/duckdb*.h
 # Built libduckdb output dirs
 stage4-duckdb/libduckdb-*/
 
+# Benchmark build artifacts (libs + no-extension bench-* executables); keep results-*.md
+bench/build/
+
 # Editor / OS / debug-session junk
 .DS_Store
 .cursor/
