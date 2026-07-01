@@ -338,7 +338,33 @@ FROM read_csv_auto('https://raw.githubusercontent.com/cs109/2014_data/master/cou
 194
 ```
 
+#### Reproducibility caveat
+
 One caveat from this local worktree: inside the Alpine build container, CMake could not derive the DuckDB git metadata and fell back to `git hash 0123456789, version v0.0.1`. That does not affect the runtime proof, but a reproducible release build should either use a normal checkout whose `.git` metadata is visible in the container or pass explicit `GIT_COMMIT_HASH` / `OVERRIDE_GIT_DESCRIBE` values.
+
+#### Timing
+
+Timing/compute cost from this run, on the M3 Pro host via Docker:
+
+```text
+final successful Alpine 3.24 httpfs/C++-runtime-static build: 1,775,194 ms = 29m 35s
+stock grafana/grafana smoke test: ~1.3s
+earlier dynamic Alpine/httpfs build: 1,171,962 ms = 19m 32s
+failed full-static curl closure attempt: 1,148,181 ms = 19m 08s
+killed full-static retry: 677,924 ms = 11m 18s before stopping
+```
+
+The repeatable commitment for Stage 8 is therefore roughly **20-30 minutes per clean architecture build** for the native DuckDB/httpfs CLI proof, before any Go/plugin packaging work. CI should assume clean builds are expensive but not outrageous, especially if amd64 and arm64 run in parallel and CMake/build caches are preserved.
+
+#### Zig/CI learning
+
+Zig learning: once `httpfs` is in scope and we choose to use the target Alpine/Grafana shared `libcurl`/OpenSSL stack, Zig is no longer carrying the whole solution by itself. Zig was excellent for the earlier fully static core-DuckDB proof because it supplied a musl compiler/runtime story from one machine. For this Stage 8 shape, the hard requirement is now "link against the same target distro libraries that will exist in `grafana/grafana`", which means each target architecture needs either:
+
+- a build running in that architecture's Alpine/Grafana-compatible environment;
+- a Docker Buildx/QEMU build for non-native architectures; or
+- a carefully assembled Alpine sysroot per architecture, with the right curl/OpenSSL headers, `.so` files, and linker metadata, so Zig can cross-compile against that sysroot.
+
+My current preference is the boring CI matrix first: build each release architecture in a matching Alpine environment, cache aggressively, and parallelize. A fancy Zig sysroot cross-build may be possible, but it is extra complexity and only worth it if the per-arch native/container builds become a real CI bottleneck. In other words, Zig is still useful background knowledge here, but after accepting `httpfs` + system `libcurl`, it is no longer the main simplifier.
 
 Verification should be a new isolated harness, e.g. `stage8-duckdb-httpfs/`, based on `stage6-duckdb-run/`:
 
