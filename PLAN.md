@@ -15,7 +15,8 @@
 - [x] **Stage 4** — `libduckdb.a` for **aarch64-musl** built (461 MB, DuckDB v1.5.4); plus the finding that zig folds `-O1/-O2/-O3` into one `-O2`-equivalent. (x86_64-musl not built — identical recipe.)
 - [x] **Stage 5** — plugin backend linked against the musl `libduckdb.a` ✓ — **331 MB fully static** aarch64 ELF (no `NEEDED` libs, no loader), built first try with `-lc++ -lc++abi`.
 - [x] **Stage 6** — ran on Alpine (arm64) ✓✓: plugin SDK initializes, and a standalone `SELECT 21*2` returns **42** — DuckDB executes queries on musl. **#80 proven solved.**
-- [x] **Stage 7 (draft)** — opened draft PR [#94](https://github.com/motherduckdb/grafana-duckdb-datasource/pull/94) adding a Zig/musl CI workflow; **green on the fork for amd64 + arm64** (build + Alpine smoke test). Awaiting maintainer review.
+- [x] **Stage 7** — opened PR [#94](https://github.com/motherduckdb/grafana-duckdb-datasource/pull/94) adding Zig/musl builds to the plugin CI/release flow; **green on the fork for amd64 + arm64** (build + Alpine smoke test). PR #94 and issue #80 were later closed because fully static musl cannot load runtime DuckDB extensions and DuckDB documents musl as a poor-performance environment.
+- [ ] **Stage 8** — bake the `httpfs` DuckDB extension into the static-musl build, so Alpine can read `https://`/S3-style inputs without relying on dynamic extension loading.
 
 ## Environment (this machine)
 
@@ -24,6 +25,8 @@
 - Scratch work happens in this repo (`zig-cc-lab/`). The plugin is a **separate clone** of
   `motherduckdb/grafana-duckdb-datasource`.
 - **Layout:** each stage lives in its own folder (`stage1-c/`, `stage2-cpp/`, `stage3-cgo/`, `stage4-duckdb/`) so cgo never picks up a sibling stage's `.c`/`.cpp` (which would collide on `main` — see Stage 3). Run each stage's commands from the repo root.
+- **Where Stage 8 lives:** keep the plan/results in this repo. The work spans the DuckDB checkout
+  (`duckdb/duckdb`) and the plugin checkout, but this lab is the narrative + reproducibility record.
 
 ## My honest take (read first)
 
@@ -217,10 +220,76 @@ Add the DuckDB datasource, run `SELECT 42;` and a `read_csv_auto(...)` to confir
 - A minimal standalone program (`stage6-duckdb-run/`, built with the identical musl toolchain) runs a real query on Alpine: **`SELECT 21*2 = 42`** → the DuckDB engine executes SQL on musl.
 - Remaining stretch (not done): the full Grafana-on-Alpine *UI* run (build the frontend, assemble the plugin dist, provision a datasource, query through the UI/API). The binary-level proofs above already establish musl compatibility; the UI run is packaging, not a new risk.
 
-## Stage 7 — (Optional) Productionize + PR for #80
+## Stage 7 — Productionize + PR for #80
 
-- Add a Mage target / build tag + a CI job that produces the musl variant with Zig (CI needs no QEMU — it's a pure cross-compile). Relevant files in the plugin repo: `Magefile.go`, `.github/workflows/ci.yml`, `README.md`.
-- Open a PR addressing [issue #80](https://github.com/motherduckdb/grafana-duckdb-datasource/issues/80); optionally upstream the musl `.a` to `duckdb-go-bindings`.
+Goal: turn the local proof into a downstream plugin CI workflow that produces static-musl backend binaries.
+
+**Result:** PR [motherduckdb/grafana-duckdb-datasource#94](https://github.com/motherduckdb/grafana-duckdb-datasource/pull/94) modified `.github/workflows/ci.yml` and `README.md` so Linux release artifacts would use static musl backend binaries. It cross-compiled amd64 + arm64 with Zig, smoke-tested both on Alpine, and was green on the fork. PR #94 and issue #80 were later closed because the fully static musl path cannot load runtime DuckDB extensions (`dlopen` is unavailable), and because DuckDB documents musl as materially slower than glibc.
+
+The unresolved design question was not "can the plugin run on Alpine?" — that was proven in Stage 6/7. For PR #94 to make sense for the MotherDuck datasource specifically, the real target would be baking in the `motherduck` extension. That is probably not testable here because the extension is closed source and would need vendor cooperation. Stage 8 uses `httpfs` instead: it is an OSS extension that proves whether the static-bundling technique can preserve remote-file behavior for a vanilla DuckDB datasource.
+
+## Stage 8 — Bake `httpfs` into static-musl DuckDB
+
+Stage 4 used the released single-file amalgamation and compiled only `duckdb.cpp`. That produces a working static musl engine, but it does not include the out-of-tree `httpfs` extension or DuckDB's generated static extension loader. In the amalgamation source, extension macros such as `DUCKDB_EXTENSION_HTTPFS_LINKED` default to false unless the build wires in the extension code.
+
+**My read:** this should be a DuckDB **CMake extension build** experiment, not another plain `zig c++ duckdb.cpp` experiment.
+
+DuckDB already has the relevant machinery:
+
+- `duckdb/duckdb/.github/config/extensions/httpfs.cmake` registers `httpfs` via `duckdb_extension_load(httpfs ...)`.
+- Because that config does not use `DONT_LINK`, the normal CMake path should statically link `httpfs`.
+- `extension/CMakeLists.txt` generates the static loader that calls `LoadStaticExtension<HttpfsExtension>()`.
+- `httpfs` pulls transitive native deps (`curl`, `openssl`, plus DuckDB's bundled crypto pieces), so collecting/linking the complete static closure is the hard part.
+
+**Does this need a DuckDB branch?** Not for the first attempt. Start with upstream DuckDB build flags/config. Only branch DuckDB if the `v1.5.4` source needs a patch for musl/vcpkg/static dependency collection. If that happens, use a local branch such as `sj/httpfs-musl-v1.5.4` and keep the patch narrow.
+
+**Version pin:** keep DuckDB at **v1.5.4** for this experiment because the Go verifier and plugin currently use `github.com/duckdb/duckdb-go/v2 v2.10504.0` / `duckdb-go-bindings v0.10504.0`. Building DuckDB `main` would muddy ABI/version compatibility.
+
+Proposed flow:
+
+```bash
+# In a clean DuckDB v1.5.4 checkout/worktree, first prove the mechanism on the host.
+make setup-vcpkg
+export VCPKG_TOOLCHAIN_PATH="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake"
+
+EXTENSION_CONFIGS='.github/config/bundled_extensions.cmake;.github/config/extensions/httpfs.cmake' \
+  USE_MERGED_VCPKG_MANIFEST=1 \
+  BUILD_HTTPFS=1 \
+  STATIC_OPENSSL=1 \
+  ENABLE_JEMALLOC=0 \
+  make extension_configuration
+
+EXTENSION_CONFIGS='.github/config/bundled_extensions.cmake;.github/config/extensions/httpfs.cmake' \
+  USE_MERGED_VCPKG_MANIFEST=1 \
+  BUILD_HTTPFS=1 \
+  STATIC_OPENSSL=1 \
+  ENABLE_JEMALLOC=0 \
+  make release
+```
+
+Then move to the musl/static artifact:
+
+```bash
+# Target shape, exact flags may need adjustment after the host proof.
+EXTENSION_CONFIGS='.github/config/bundled_extensions.cmake;.github/config/extensions/httpfs.cmake' \
+  USE_MERGED_VCPKG_MANIFEST=1 \
+  BUILD_HTTPFS=1 \
+  STATIC_OPENSSL=1 \
+  ENABLE_JEMALLOC=0 \
+  DISABLE_EXTENSION_LOAD=1 \
+  make bundle-library
+```
+
+Use `make bundle-library` rather than only `make gather-libs` if possible: `gather-libs` collects DuckDB/extension archives, while `bundle-library` is designed to also pull vcpkg `.a` files and other linked static libraries into one archive. If that archive links cleanly from Go, it avoids hand-maintaining a long curl/openssl/zlib/crypto link line.
+
+Verification should be a new isolated harness, e.g. `stage8-duckdb-httpfs/`, based on `stage6-duckdb-run/`:
+
+- run `SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name = 'httpfs';`
+- start a tiny local HTTP server inside the Alpine/Docker test and query a CSV via `read_csv('http://127.0.0.1:.../sample.csv')`;
+- link with `duckdb_use_static_lib`, `CC="zig cc -target aarch64-linux-musl"`, `CXX="zig c++ -target aarch64-linux-musl"`, and `-extldflags "-static"`;
+- record `file` / `llvm-readelf` output, binary size, and the SQL result here.
+
+If Stage 8 works, it does **not** revive PR #94 by itself. Reviving PR #94 for the MotherDuck datasource would require the analogous thing with the closed-source `motherduck` extension baked in. What Stage 8 can prove is narrower and more interesting for a vanilla DuckDB datasource: "a static-musl DuckDB-backed plugin can keep `httpfs`/remote-file behavior by compiling the OSS extension in, despite dynamic DuckDB extensions being unavailable."
 
 ## Then extend the same technique to Grafana (optional)
 
@@ -228,12 +297,14 @@ Once the plugin works, do the trivial contrast: cross-compile Grafana's backend 
 
 ## Biggest risks (honest)
 
-- Stage 4 (DuckDB amalgamation under `zig c++`) is the main unknown — long builds, possible source/flag incompatibilities, and the libc++ vs libstdc++ runtime mismatch. Stage 2 gives an early read on the static-musl C++ runtime and Stage 3 on Go+cgo — both quick and low-risk — so by the end of Stage 3 we'll know whether the hard part is viable.
-- Zig **0.16.0** is bleeding-edge; Stages 0–3 are fine, but if Stage 4's big C++ build hits `zig c++` regressions, fall back to a known-good stable (e.g. 0.14.x) from a tarball at ziglang.org/download.
+- Stage 8 is likely to fail first on dependency closure, not DuckDB registration: `httpfs` needs curl/openssl and their static musl transitive deps to be collected and linked into the final Go binary.
+- The Stage 4 single-amalgamation shortcut is proven for core DuckDB, but it is probably the wrong build primitive for out-of-tree extensions. Use DuckDB CMake first; only fall back to patching `package_build.py`/amalgamation generation if CMake cannot produce a usable artifact.
+- Even if `httpfs` works, this does not remove the larger objection recorded when #94/#80 were closed: DuckDB recommends glibc over musl for performance, and static linking still cannot support arbitrary runtime extensions. For the MotherDuck datasource, the relevant extension is `motherduck`, not `httpfs`.
+- Zig **0.16.0** is bleeding-edge; if a big C++ build hits `zig c++` regressions, fall back to a known-good stable (e.g. 0.14.x) from a tarball at ziglang.org/download.
 
 ## Follow-ups (not done in this session — left for you)
 
-- **Stage 7 (PR for #80):** done as a draft — PR [#94](https://github.com/motherduckdb/grafana-duckdb-datasource/pull/94) adds `.github/workflows/build-linux-musl.yml` (cross-compiles static musl binaries with `zig cc` — no QEMU for the build — and smoke-tests them on Alpine). **CI is green on the fork for amd64 + arm64** (arm64 needs an added swap step for the memory-heavy aarch64 amalgamation compile; pinned Zig 0.16.0). Remaining: maintainer review + the PR's design questions (long-term source of `libduckdb.a`; whether the static build replaces the glibc `linux` build; Magefile target vs standalone workflow).
+- **Stage 7 (PR for #80):** done as PR [#94](https://github.com/motherduckdb/grafana-duckdb-datasource/pull/94), which modified `.github/workflows/ci.yml` to cross-compile static musl binaries with `zig cc` (no QEMU for the build) and smoke-test them on Alpine. **CI was green on the fork for amd64 + arm64** (arm64 needed an added swap step for the memory-heavy aarch64 amalgamation compile; pinned Zig 0.16.0). PR #94 and issue #80 were later closed because dynamic DuckDB extensions cannot load from the fully static binary and musl is a poor performance fit for DuckDB; Stage 8 may be the reason to revisit a narrower vanilla-DuckDB datasource variant, not the MotherDuck datasource as-is.
 - **x86_64-musl `libduckdb`:** not built — identical recipe (`-target x86_64-linux-musl`). Worth doing since Grafana Cloud nodes are likely amd64; run on Alpine amd64 via Rosetta/qemu or a real amd64 K8s node.
 - **Full Grafana-on-Alpine UI run** + a `read_csv_auto(...)`/extension query (the Stage 6 stretch). The binary-level proof is done; this is packaging.
 - **`-O3`** — only if a benchmark on real queries justifies it; that means native Alpine gcc, not zig (see the Stage 4 `-O2` justification).

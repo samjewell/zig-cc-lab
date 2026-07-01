@@ -25,7 +25,8 @@ Each stage de-risks the next. Full commands, output, and status live in [`PLAN.m
 | 4 | build `libduckdb.a` for `aarch64-linux-musl` | the big C++ amalgamation compiles under zig |
 | 5 | build the plugin backend against that `.a` | a real CGo binary links against our musl DuckDB |
 | 6 | run it on Alpine | the #80 fix — no glibc/`libstdc++` loader errors |
-| 7 | (optional) productionize + upstream | CI / PR |
+| 7 | productionize + PR #94 | CI can build/test static-musl plugin binaries |
+| 8 | bake in `httpfs` | static-musl DuckDB can keep remote-file extension behavior |
 
 See the **Progress** checklist at the top of [`PLAN.md`](./PLAN.md) for current status.
 
@@ -43,7 +44,7 @@ See the **Progress** checklist at the top of [`PLAN.md`](./PLAN.md) for current 
 
 ## Layout
 
-- `stage1-c/`, `stage2-cpp/`, `stage3-cgo/`, `stage4-duckdb/` — per-stage scratch (each isolated so `cgo` doesn't
+- `stage1-c/`, `stage2-cpp/`, `stage3-cgo/`, `stage4-duckdb/`, `stage6-duckdb-run/` — per-stage scratch (each isolated so `cgo` doesn't
   pick up a sibling's source).
 - `opt-test/` — the optimization-level investigation: the repro script plus the writeups posted upstream.
 - `PLAN.md` — the detailed, living plan: commands, measurements, findings, and decisions.
