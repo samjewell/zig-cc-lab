@@ -16,7 +16,7 @@
 - [x] **Stage 5** — plugin backend linked against the musl `libduckdb.a` ✓ — **331 MB fully static** aarch64 ELF (no `NEEDED` libs, no loader), built first try with `-lc++ -lc++abi`.
 - [x] **Stage 6** — ran on Alpine (arm64) ✓✓: plugin SDK initializes, and a standalone `SELECT 21*2` returns **42** — DuckDB executes queries on musl. **#80 proven solved.**
 - [x] **Stage 7** — opened PR [#94](https://github.com/motherduckdb/grafana-duckdb-datasource/pull/94) adding Zig/musl builds to the plugin CI/release flow; **green on the fork for amd64 + arm64** (build + Alpine smoke test). PR #94 and issue #80 were later closed because fully static musl cannot load runtime DuckDB extensions and DuckDB documents musl as a poor-performance environment.
-- [ ] **Stage 8** — bake the `httpfs` DuckDB extension into the static-musl build, so Alpine can read `https://`/S3-style inputs without relying on dynamic extension loading.
+- [ ] **Stage 8** — bake the `httpfs` DuckDB extension into a musl/Alpine build that runs in the stock `grafana/grafana` image, so Alpine can read `https://`/S3-style inputs without relying on dynamic extension loading.
 
 ## Environment (this machine)
 
@@ -267,26 +267,37 @@ EXTENSION_CONFIGS='.github/config/bundled_extensions.cmake;.github/config/extens
   make release
 ```
 
-Then move to the musl/static artifact:
+Then move to the musl/Alpine artifact. The clarified target is not "every transitive dependency is static"; it is "runs inside the default `grafana/grafana` Alpine image without `apk add`." That image already provides musl, `libcurl`, OpenSSL, zlib, and curl's shared transitive dependencies, but not the C++ runtime libraries that DuckDB normally needs.
 
 ```bash
-# Target shape, exact flags may need adjustment after the host proof.
+# First target: dynamically use Alpine/Grafana-provided curl/OpenSSL/zlib,
+# but statically link the C++ runtime so the artifact does not require
+# libstdc++.so.6 or libgcc_s.so.1 in the Grafana image.
 EXTENSION_CONFIGS='.github/config/bundled_extensions.cmake;.github/config/extensions/httpfs.cmake' \
   USE_MERGED_VCPKG_MANIFEST=1 \
   BUILD_HTTPFS=1 \
-  STATIC_OPENSSL=1 \
   ENABLE_JEMALLOC=0 \
   DISABLE_EXTENSION_LOAD=1 \
-  make bundle-library
+  CMAKE_EXE_LINKER_FLAGS='-static-libstdc++ -static-libgcc' \
+  make release
 ```
 
-Use `make bundle-library` rather than only `make gather-libs` if possible: `gather-libs` collects DuckDB/extension archives, while `bundle-library` is designed to also pull vcpkg `.a` files and other linked static libraries into one archive. If that archive links cleanly from Go, it avoids hand-maintaining a long curl/openssl/zlib/crypto link line.
+Do the first smoke test against the DuckDB CLI because it isolates the native runtime question from Go/plugin packaging:
+
+- `file`/`ldd` should show no dependency on `libstdc++.so.6` or `libgcc_s.so.1`;
+- running the CLI inside `grafana/grafana` with `--entrypoint sh` should work without installing packages;
+- `SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name = 'httpfs';` should report `httpfs` available/loaded;
+- an `https://` or local HTTP `read_csv(...)` query should succeed.
+
+Only if the stock-image CLI smoke passes, move the same build shape into the Go/plugin proof. If the CLI still needs libraries missing from `grafana/grafana`, fix that native dependency shape before involving cgo.
+
+The full-static fallback is deliberately lower priority now: `make bundle-library`/static curl closure is still useful if the Grafana image stops shipping the needed shared libraries, but it pulls in curl's entire static transitive dependency graph and is not required by the clarified default-image goal.
 
 Verification should be a new isolated harness, e.g. `stage8-duckdb-httpfs/`, based on `stage6-duckdb-run/`:
 
 - run `SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name = 'httpfs';`
 - start a tiny local HTTP server inside the Alpine/Docker test and query a CSV via `read_csv('http://127.0.0.1:.../sample.csv')`;
-- link with `duckdb_use_static_lib`, `CC="zig cc -target aarch64-linux-musl"`, `CXX="zig c++ -target aarch64-linux-musl"`, and `-extldflags "-static"`;
+- link with `duckdb_use_static_lib`; if the Go verifier uses Grafana-provided shared curl/OpenSSL/zlib, do not force `-extldflags "-static"` for the entire binary, but do keep the C++ runtime static;
 - record `file` / `llvm-readelf` output, binary size, and the SQL result here.
 
 If Stage 8 works, it does **not** revive PR #94 by itself. Reviving PR #94 for the MotherDuck datasource would require the analogous thing with the closed-source `motherduck` extension baked in. What Stage 8 can prove is narrower and more interesting for a vanilla DuckDB datasource: "a static-musl DuckDB-backed plugin can keep `httpfs`/remote-file behavior by compiling the OSS extension in, despite dynamic DuckDB extensions being unavailable."
@@ -297,7 +308,7 @@ Once the plugin works, do the trivial contrast: cross-compile Grafana's backend 
 
 ## Biggest risks (honest)
 
-- Stage 8 is likely to fail first on dependency closure, not DuckDB registration: `httpfs` needs curl/openssl and their static musl transitive deps to be collected and linked into the final Go binary.
+- Stage 8 is likely to fail first on dependency shape, not DuckDB registration: `httpfs` needs curl/OpenSSL/zlib, and the artifact must either use the shared libraries already present in the stock Grafana Alpine image or carry its own copies. The C++ runtime should not be assumed present.
 - The Stage 4 single-amalgamation shortcut is proven for core DuckDB, but it is probably the wrong build primitive for out-of-tree extensions. Use DuckDB CMake first; only fall back to patching `package_build.py`/amalgamation generation if CMake cannot produce a usable artifact.
 - Even if `httpfs` works, this does not remove the larger objection recorded when #94/#80 were closed: DuckDB recommends glibc over musl for performance, and static linking still cannot support arbitrary runtime extensions. For the MotherDuck datasource, the relevant extension is `motherduck`, not `httpfs`.
 - Zig **0.16.0** is bleeding-edge; if a big C++ build hits `zig c++` regressions, fall back to a known-good stable (e.g. 0.14.x) from a tarball at ziglang.org/download.
