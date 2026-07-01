@@ -16,7 +16,7 @@
 - [x] **Stage 5** — plugin backend linked against the musl `libduckdb.a` ✓ — **331 MB fully static** aarch64 ELF (no `NEEDED` libs, no loader), built first try with `-lc++ -lc++abi`.
 - [x] **Stage 6** — ran on Alpine (arm64) ✓✓: plugin SDK initializes, and a standalone `SELECT 21*2` returns **42** — DuckDB executes queries on musl. **#80 proven solved.**
 - [x] **Stage 7** — opened PR [#94](https://github.com/motherduckdb/grafana-duckdb-datasource/pull/94) adding Zig/musl builds to the plugin CI/release flow; **green on the fork for amd64 + arm64** (build + Alpine smoke test). PR #94 and issue #80 were later closed because fully static musl cannot load runtime DuckDB extensions and DuckDB documents musl as a poor-performance environment.
-- [ ] **Stage 8** — bake the `httpfs` DuckDB extension into a musl/Alpine build that runs in the stock `grafana/grafana` image, so Alpine can read `https://`/S3-style inputs without relying on dynamic extension loading.
+- [ ] **Stage 8** — bake the `httpfs` DuckDB extension into a musl/Alpine build that runs in the stock `grafana/grafana` image, so Alpine can read `https://`/S3-style inputs without relying on dynamic extension loading. CLI/native proof is green; Go/plugin verifier still pending.
 
 ## Environment (this machine)
 
@@ -292,6 +292,53 @@ Do the first smoke test against the DuckDB CLI because it isolates the native ru
 Only if the stock-image CLI smoke passes, move the same build shape into the Go/plugin proof. If the CLI still needs libraries missing from `grafana/grafana`, fix that native dependency shape before involving cgo.
 
 The full-static fallback is deliberately lower priority now: `make bundle-library`/static curl closure is still useful if the Grafana image stops shipping the needed shared libraries, but it pulls in curl's entire static transitive dependency graph and is not required by the clarified default-image goal.
+
+### Stage 8 result so far — CLI/native proof
+
+The narrower target works for the DuckDB CLI on arm64 Alpine:
+
+```bash
+docker run --rm --platform linux/arm64 \
+  -v "$PWD:$PWD" -w "$PWD" \
+  alpine:3.24 sh -lc '
+    apk add --no-cache build-base cmake ninja git python3 perl curl-dev openssl-dev zlib-dev file >/dev/null &&
+    cmake -G Ninja -S . -B build/alpine-arm64-httpfs-cxxstatic \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_EXTENSIONS="httpfs" \
+      -DDUCKDB_EXTENSION_CONFIGS=".github/config/bundled_extensions.cmake;.github/config/extensions/httpfs.cmake" \
+      -DENABLE_JEMALLOC=0 \
+      -DDISABLE_EXTENSION_LOAD=1 \
+      -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" &&
+    cmake --build build/alpine-arm64-httpfs-cxxstatic --target duckdb
+  '
+```
+
+The resulting CLI is a dynamic musl PIE, but with the C++ runtime linked statically:
+
+```text
+build/alpine-arm64-httpfs-cxxstatic/duckdb: ELF 64-bit LSB pie executable, ARM aarch64, dynamically linked, interpreter /lib/ld-musl-aarch64.so.1
+size: 61,903,960 bytes / 59.7 MiB
+readelf -d NEEDED: libcurl.so.4, libssl.so.3, libcrypto.so.3, libc.musl-aarch64.so.1
+```
+
+Important: `libstdc++.so.6` and `libgcc_s.so.1` are absent from `NEEDED` and `ldd`, which is the piece missing from the stock Grafana image. `ldd` still resolves curl's shared transitive dependencies (`libcares`, `libnghttp2`, `libidn2`, `libpsl`, `libzstd`, `libbrotli*`, `libz`, `libunistring`) from Alpine/Grafana.
+
+The unmodified `grafana/grafana:latest` image used for the smoke test was Alpine 3.24.1. It did not have `libstdc++`/`libgcc_s`, but it did have the curl/OpenSSL/zlib stack needed by this artifact. Running the CLI inside that image with `--entrypoint sh`, without `apk add`, passed:
+
+```text
+SELECT extension_name, loaded, installed
+FROM duckdb_extensions()
+WHERE extension_name = 'httpfs';
+
+httpfs | true | true
+
+SELECT count(*) AS countries
+FROM read_csv_auto('https://raw.githubusercontent.com/cs109/2014_data/master/countries.csv');
+
+194
+```
+
+One caveat from this local worktree: inside the Alpine build container, CMake could not derive the DuckDB git metadata and fell back to `git hash 0123456789, version v0.0.1`. That does not affect the runtime proof, but a reproducible release build should either use a normal checkout whose `.git` metadata is visible in the container or pass explicit `GIT_COMMIT_HASH` / `OVERRIDE_GIT_DESCRIBE` values.
 
 Verification should be a new isolated harness, e.g. `stage8-duckdb-httpfs/`, based on `stage6-duckdb-run/`:
 
